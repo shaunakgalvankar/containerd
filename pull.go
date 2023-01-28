@@ -42,7 +42,7 @@ const (
 func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Image, retErr error) {
 	ctx, span := tracing.StartSpan(ctx, tracing.Name(pullSpanPrefix, "Pull"))
 	defer span.End()
-
+	fmt.Println("Hello Docker")
 	pullCtx := defaultRemoteContext()
 
 	for _, o := range opts {
