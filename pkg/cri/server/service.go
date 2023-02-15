@@ -28,9 +28,10 @@ import (
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/pkg/cri/instrument"
+	"github.com/containerd/containerd/pkg/cri/nri"
 	"github.com/containerd/containerd/pkg/cri/streaming"
 	"github.com/containerd/containerd/pkg/kmutex"
-	"github.com/containerd/containerd/pkg/nri"
 	"github.com/containerd/containerd/plugin"
 	runtime_alpha "github.com/containerd/containerd/third_party/k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	cni "github.com/containerd/go-cni"
@@ -54,25 +55,16 @@ import (
 // defaultNetworkPlugin is used for the default CNI configuration
 const defaultNetworkPlugin = "default"
 
-// grpcServices are all the grpc services provided by cri containerd.
-type grpcServices interface {
-	runtime.RuntimeServiceServer
-	runtime.ImageServiceServer
-}
-
-type grpcAlphaServices interface {
-	runtime_alpha.RuntimeServiceServer
-	runtime_alpha.ImageServiceServer
-}
-
 // CRIService is the interface implement CRI remote service server.
 type CRIService interface {
+	runtime.RuntimeServiceServer
+	runtime.ImageServiceServer
+	// Closer is used by containerd to gracefully stop cri service.
+	io.Closer
+
 	Run() error
 
-	// io.Closer is used by containerd to gracefully stop cri service.
-	io.Closer
 	Register(*grpc.Server) error
-	grpcServices
 }
 
 // criService implements CRIService.
@@ -120,15 +112,15 @@ type criService struct {
 	// one in-flight fetch request or unpack handler for a given descriptor's
 	// or chain ID.
 	unpackDuplicationSuppressor kmutex.KeyedLocker
-
-	nri *nriAPI
+	// nri is used to hook NRI into CRI request processing.
+	nri *nri.API
 	// containerEventsChan is used to capture container events and send them
 	// to the caller of GetContainerEvents.
 	containerEventsChan chan runtime.ContainerEventResponse
 }
 
 // NewCRIService returns a new instance of CRIService
-func NewCRIService(config criconfig.Config, client *containerd.Client, nrip nri.API) (CRIService, error) {
+func NewCRIService(config criconfig.Config, client *containerd.Client, nri *nri.API) (CRIService, error) {
 	var err error
 	labels := label.NewStore()
 	c := &criService{
@@ -191,12 +183,7 @@ func NewCRIService(config criconfig.Config, client *containerd.Client, nrip nri.
 		return nil, err
 	}
 
-	if nrip != nil {
-		c.nri = &nriAPI{
-			cri: c,
-			nri: nrip,
-		}
-	}
+	c.nri = nri
 
 	return c, nil
 }
@@ -266,7 +253,10 @@ func (c *criService) Run() error {
 		}
 	}()
 
-	c.nri.register()
+	// register CRI domain with NRI
+	if err := c.nri.Register(&criImplementation{c}); err != nil {
+		return fmt.Errorf("failed to set up NRI for CRI service: %w", err)
+	}
 
 	// Set the server as initialized. GRPC services could start serving traffic.
 	c.initialized.Set()
@@ -300,6 +290,7 @@ func (c *criService) Run() error {
 	if cniNetConfMonitorErr != nil {
 		return fmt.Errorf("cni network conf monitor error: %w", cniNetConfMonitorErr)
 	}
+
 	return nil
 }
 
@@ -319,13 +310,20 @@ func (c *criService) Close() error {
 	return nil
 }
 
+// IsInitialized indicates whether CRI service has finished initialization.
+func (c *criService) IsInitialized() bool {
+	return c.initialized.IsSet()
+}
+
 func (c *criService) register(s *grpc.Server) error {
-	instrumented := newInstrumentedService(c)
+	instrumented := instrument.NewService(c)
 	runtime.RegisterRuntimeServiceServer(s, instrumented)
 	runtime.RegisterImageServiceServer(s, instrumented)
-	instrumentedAlpha := newInstrumentedAlphaService(c)
+
+	instrumentedAlpha := instrument.NewAlphaService(c)
 	runtime_alpha.RegisterRuntimeServiceServer(s, instrumentedAlpha)
 	runtime_alpha.RegisterImageServiceServer(s, instrumentedAlpha)
+
 	return nil
 }
 

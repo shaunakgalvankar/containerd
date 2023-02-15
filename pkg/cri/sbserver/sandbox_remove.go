@@ -86,8 +86,13 @@ func (c *criService) RemovePodSandbox(ctx context.Context, r *runtime.RemovePodS
 		return nil, fmt.Errorf("failed to get sandbox controller: %w", err)
 	}
 
-	if _, err := controller.Shutdown(ctx, id); err != nil && !errdefs.IsNotFound(err) {
+	if err := controller.Shutdown(ctx, id); err != nil && !errdefs.IsNotFound(err) {
 		return nil, fmt.Errorf("failed to delete sandbox %q: %w", id, err)
+	}
+
+	err = c.nri.RemovePodSandbox(ctx, &sandbox)
+	if err != nil {
+		log.G(ctx).WithError(err).Errorf("NRI pod removal notification failed")
 	}
 
 	// Remove sandbox from sandbox store. Note that once the sandbox is successfully

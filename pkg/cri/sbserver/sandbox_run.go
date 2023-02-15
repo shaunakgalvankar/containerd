@@ -27,23 +27,21 @@ import (
 	"time"
 
 	"github.com/containerd/go-cni"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/typeurl/v2"
+	"github.com/hashicorp/go-multierror"
 	"github.com/sirupsen/logrus"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
-	eventtypes "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/pkg/cri/sbserver/podsandbox"
-	"github.com/containerd/containerd/protobuf"
-	sb "github.com/containerd/containerd/sandbox"
-
+	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/pkg/cri/annotations"
 	criconfig "github.com/containerd/containerd/pkg/cri/config"
+	"github.com/containerd/containerd/pkg/cri/sbserver/podsandbox"
 	"github.com/containerd/containerd/pkg/cri/server/bandwidth"
 	sandboxstore "github.com/containerd/containerd/pkg/cri/store/sandbox"
 	"github.com/containerd/containerd/pkg/cri/util"
-	ctrdutil "github.com/containerd/containerd/pkg/cri/util"
 	"github.com/containerd/containerd/pkg/netns"
+	sb "github.com/containerd/containerd/sandbox"
 )
 
 func init() {
@@ -187,7 +185,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		defer func() {
 			// Remove the network namespace only if all the resource cleanup is done.
 			if retErr != nil && cleanupErr == nil {
-				deferCtx, deferCancel := ctrdutil.DeferContext()
+				deferCtx, deferCancel := util.DeferContext()
 				defer deferCancel()
 				// Teardown network if an error is returned.
 				if cleanupErr = c.teardownPodNetwork(deferCtx, sandbox); cleanupErr != nil {
@@ -227,16 +225,23 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 
 	runtimeStart := time.Now()
 
-	if err := controller.Create(ctx, id); err != nil {
+	if err := controller.Create(ctx, id, sb.WithOptions(config)); err != nil {
 		return nil, fmt.Errorf("failed to create sandbox %q: %w", id, err)
 	}
 
-	resp, err := controller.Start(ctx, id)
+	ctrl, err := controller.Start(ctx, id)
 	if err != nil {
 		sandbox.Container, _ = c.client.LoadContainer(ctx, id)
-		if resp != nil && resp.SandboxID == "" && resp.Pid == 0 && resp.CreatedAt == nil && len(resp.Labels) == 0 {
-			// if resp is a non-nil zero-value, an error occurred during cleanup
-			cleanupErr = fmt.Errorf("failed to cleanup sandbox")
+		var cerr podsandbox.CleanupErr
+		if errors.As(err, &cerr) {
+			cleanupErr = fmt.Errorf("failed to cleanup sandbox: %w", cerr)
+
+			// Strip last error as cleanup error to handle separately
+			if merr, ok := err.(*multierror.Error); ok {
+				if errs := merr.WrappedErrors(); len(errs) > 0 {
+					err = errs[0]
+				}
+			}
 		}
 		return nil, fmt.Errorf("failed to start sandbox %q: %w", id, err)
 	}
@@ -250,18 +255,31 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		sandbox.Container = container
 	}
 
-	labels := resp.GetLabels()
+	labels := ctrl.Labels
 	if labels == nil {
 		labels = map[string]string{}
 	}
 
 	sandbox.ProcessLabel = labels["selinux_label"]
 
+	err = c.nri.RunPodSandbox(ctx, &sandbox)
+	if err != nil {
+		return nil, fmt.Errorf("NRI RunPodSandbox failed: %w", err)
+	}
+
+	defer func() {
+		if retErr != nil {
+			deferCtx, deferCancel := util.DeferContext()
+			defer deferCancel()
+			c.nri.RemovePodSandbox(deferCtx, &sandbox)
+		}
+	}()
+
 	if err := sandbox.Status.Update(func(status sandboxstore.Status) (sandboxstore.Status, error) {
 		// Set the pod sandbox as ready after successfully start sandbox container.
-		status.Pid = resp.Pid
+		status.Pid = ctrl.Pid
 		status.State = sandboxstore.StateReady
-		status.CreatedAt = protobuf.FromTimestamp(resp.CreatedAt)
+		status.CreatedAt = ctrl.CreatedAt
 		return status, nil
 	}); err != nil {
 		return nil, fmt.Errorf("failed to update sandbox status: %w", err)
@@ -272,28 +290,36 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		return nil, fmt.Errorf("failed to add sandbox %+v into store: %w", sandbox, err)
 	}
 
+	// Send CONTAINER_CREATED event with both ContainerId and SandboxId equal to SandboxId.
+	// Note that this has to be done after sandboxStore.Add() because we need to get
+	// SandboxStatus from the store and include it in the event.
+	c.generateAndSendContainerEvent(ctx, id, id, runtime.ContainerEventType_CONTAINER_CREATED_EVENT)
+
+	// TODO: Use sandbox client instead
+	exitCh := make(chan containerd.ExitStatus, 1)
+	go func() {
+		defer close(exitCh)
+
+		ctx := util.NamespacedContext()
+		resp, err := controller.Wait(ctx, id)
+		if err != nil {
+			log.G(ctx).WithError(err).Error("failed to wait for sandbox exit")
+			exitCh <- *containerd.NewExitStatus(containerd.UnknownExitStatus, time.Time{}, err)
+			return
+		}
+
+		exitCh <- *containerd.NewExitStatus(resp.ExitStatus, resp.ExitedAt, nil)
+	}()
+
 	// start the monitor after adding sandbox into the store, this ensures
 	// that sandbox is in the store, when event monitor receives the TaskExit event.
 	//
 	// TaskOOM from containerd may come before sandbox is added to store,
 	// but we don't care about sandbox TaskOOM right now, so it is fine.
-	go func() {
-		resp, err := controller.Wait(ctrdutil.NamespacedContext(), id)
-		if err != nil {
-			log.G(ctx).WithError(err).Error("failed to wait for sandbox controller, skipping exit event")
-			return
-		}
+	c.eventMonitor.startSandboxExitMonitor(context.Background(), id, ctrl.Pid, exitCh)
 
-		e := &eventtypes.TaskExit{
-			ContainerID: id,
-			ID:          id,
-			// Pid is not used
-			Pid:        0,
-			ExitStatus: resp.ExitStatus,
-			ExitedAt:   resp.ExitedAt,
-		}
-		c.eventMonitor.backOff.enBackOff(id, e)
-	}()
+	// Send CONTAINER_STARTED event with ContainerId equal to SandboxId.
+	c.generateAndSendContainerEvent(ctx, id, id, runtime.ContainerEventType_CONTAINER_STARTED_EVENT)
 
 	sandboxRuntimeCreateTimer.WithValues(labels["oci_runtime_type"]).UpdateSince(runtimeStart)
 
@@ -381,6 +407,10 @@ func cniNamespaceOpts(id string, config *runtime.PodSandboxConfig) ([]cni.Namesp
 	dns := toCNIDNS(config.GetDnsConfig())
 	if dns != nil {
 		opts = append(opts, cni.WithCapabilityDNS(*dns))
+	}
+
+	if cgroup := config.GetLinux().GetCgroupParent(); cgroup != "" {
+		opts = append(opts, cni.WithCapabilityCgroupPath(cgroup))
 	}
 
 	return opts, nil

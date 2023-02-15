@@ -33,7 +33,7 @@ import (
 	sandboxstore "github.com/containerd/containerd/pkg/cri/store/sandbox"
 	ctrdutil "github.com/containerd/containerd/pkg/cri/util"
 	"github.com/containerd/containerd/protobuf"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/typeurl/v2"
 	"github.com/sirupsen/logrus"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/utils/clock"
@@ -385,7 +385,7 @@ func handleContainerExit(ctx context.Context, e *eventtypes.TaskExit, cntr conta
 		}
 	} else {
 		// TODO(random-liu): [P1] This may block the loop, we may want to spawn a worker
-		if _, err = task.Delete(ctx, WithNRISandboxDelete(cntr.SandboxID), containerd.WithProcessKill); err != nil {
+		if _, err = task.Delete(ctx, c.nri.WithContainerExit(&cntr), containerd.WithProcessKill); err != nil {
 			if !errdefs.IsNotFound(err) {
 				return fmt.Errorf("failed to stop container: %w", err)
 			}
@@ -428,14 +428,12 @@ func handleSandboxExit(ctx context.Context, e *eventtypes.TaskExit, sb sandboxst
 			}
 		} else {
 			// TODO(random-liu): [P1] This may block the loop, we may want to spawn a worker
-			if _, err = task.Delete(ctx, WithNRISandboxDelete(sb.ID), containerd.WithProcessKill); err != nil {
+			if _, err = task.Delete(ctx, containerd.WithProcessKill); err != nil {
 				if !errdefs.IsNotFound(err) {
 					return fmt.Errorf("failed to stop sandbox: %w", err)
 				}
 				// Move on to make sure container status is updated.
 			}
-
-			c.generateAndSendContainerEvent(ctx, sb.ID, sb.ID, runtime.ContainerEventType_CONTAINER_STOPPED_EVENT)
 		}
 	}
 
@@ -449,7 +447,7 @@ func handleSandboxExit(ctx context.Context, e *eventtypes.TaskExit, sb sandboxst
 
 	// Using channel to propagate the information of sandbox stop
 	sb.Stop()
-
+	c.generateAndSendContainerEvent(ctx, sb.ID, sb.ID, runtime.ContainerEventType_CONTAINER_STOPPED_EVENT)
 	return nil
 }
 

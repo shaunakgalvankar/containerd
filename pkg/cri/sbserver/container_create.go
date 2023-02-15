@@ -24,7 +24,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/containerd/typeurl"
+	"github.com/containerd/typeurl/v2"
 	"github.com/davecgh/go-spew/spew"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
@@ -36,14 +36,13 @@ import (
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/pkg/blockio"
 	"github.com/containerd/containerd/pkg/cri/annotations"
-	"github.com/containerd/containerd/pkg/cri/config"
 	criconfig "github.com/containerd/containerd/pkg/cri/config"
 	cio "github.com/containerd/containerd/pkg/cri/io"
 	customopts "github.com/containerd/containerd/pkg/cri/opts"
 	containerstore "github.com/containerd/containerd/pkg/cri/store/container"
 	"github.com/containerd/containerd/pkg/cri/util"
-	ctrdutil "github.com/containerd/containerd/pkg/cri/util"
 	"github.com/containerd/containerd/platforms"
 )
 
@@ -67,14 +66,14 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		return nil, fmt.Errorf("failed to get sandbox controller: %w", err)
 	}
 
-	statusResponse, err := controller.Status(ctx, sandbox.ID, false)
+	cstatus, err := controller.Status(ctx, sandbox.ID, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get controller status: %w", err)
 	}
 
 	var (
-		sandboxID  = statusResponse.GetID()
-		sandboxPid = statusResponse.GetPid()
+		sandboxID  = cstatus.SandboxID
+		sandboxPid = cstatus.Pid
 	)
 
 	// Generate unique id and name for the container and reserve the name.
@@ -279,13 +278,22 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		opts = append(opts, containerd.WithSandbox(sandboxID))
 	}
 
+	opts = append(opts, c.nri.WithContainerAdjustment())
+	defer func() {
+		if retErr != nil {
+			deferCtx, deferCancel := util.DeferContext()
+			defer deferCancel()
+			c.nri.UndoCreateContainer(deferCtx, &sandbox, id, spec)
+		}
+	}()
+
 	var cntr containerd.Container
 	if cntr, err = c.client.NewContainer(ctx, id, opts...); err != nil {
 		return nil, fmt.Errorf("failed to create containerd container: %w", err)
 	}
 	defer func() {
 		if retErr != nil {
-			deferCtx, deferCancel := ctrdutil.DeferContext()
+			deferCtx, deferCancel := util.DeferContext()
 			defer deferCancel()
 			if err := cntr.Delete(deferCtx, containerd.WithSnapshotCleanup); err != nil {
 				log.G(ctx).WithError(err).Errorf("Failed to delete containerd container %q", id)
@@ -318,6 +326,11 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	}
 
 	c.generateAndSendContainerEvent(ctx, id, sandboxID, runtime.ContainerEventType_CONTAINER_CREATED_EVENT)
+
+	err = c.nri.PostCreateContainer(ctx, &sandbox, &container)
+	if err != nil {
+		log.G(ctx).WithError(err).Errorf("NRI post-create notification failed")
+	}
 
 	containerCreateTimer.WithValues(ociRuntime.Type).UpdateSince(start)
 
@@ -355,7 +368,7 @@ func (c *criService) volumeMounts(containerRootDir string, criMounts []*runtime.
 // runtimeSpec returns a default runtime spec used in cri-containerd.
 func (c *criService) runtimeSpec(id string, platform platforms.Platform, baseSpecFile string, opts ...oci.SpecOpts) (*runtimespec.Spec, error) {
 	// GenerateSpec needs namespace.
-	ctx := ctrdutil.NamespacedContext()
+	ctx := util.NamespacedContext()
 	container := &containers.Container{ID: id}
 
 	if baseSpecFile != "" {
@@ -418,7 +431,7 @@ func (c *criService) buildContainerSpec(
 	sandboxConfig *runtime.PodSandboxConfig,
 	imageConfig *imagespec.ImageConfig,
 	extraMounts []*runtime.Mount,
-	ociRuntime config.Runtime,
+	ociRuntime criconfig.Runtime,
 ) (_ *runtimespec.Spec, retErr error) {
 	var (
 		specOpts []oci.SpecOpts
@@ -493,7 +506,7 @@ func (c *criService) buildLinuxSpec(
 	sandboxConfig *runtime.PodSandboxConfig,
 	imageConfig *imagespec.ImageConfig,
 	extraMounts []*runtime.Mount,
-	ociRuntime config.Runtime,
+	ociRuntime criconfig.Runtime,
 ) (_ []oci.SpecOpts, retErr error) {
 	specOpts := []oci.SpecOpts{
 		oci.WithoutRunMount,
@@ -641,7 +654,7 @@ func (c *criService) buildLinuxSpec(
 		return nil, fmt.Errorf("failed to set blockio class: %w", err)
 	}
 	if blockIOClass != "" {
-		if linuxBlockIO, err := blockIOToLinuxOci(blockIOClass); err == nil {
+		if linuxBlockIO, err := blockio.ClassNameToLinuxOCI(blockIOClass); err == nil {
 			specOpts = append(specOpts, oci.WithBlockIO(linuxBlockIO))
 		} else {
 			return nil, err
@@ -697,13 +710,10 @@ func (c *criService) buildLinuxSpec(
 		customopts.WithOOMScoreAdj(config, c.config.RestrictOOMScoreAdj),
 		customopts.WithPodNamespaces(securityContext, sandboxPid, targetPid, uids, gids),
 		customopts.WithSupplementalGroups(supplementalGroups),
-		customopts.WithAnnotation(annotations.ContainerType, annotations.ContainerTypeContainer),
-		customopts.WithAnnotation(annotations.SandboxID, sandboxID),
-		customopts.WithAnnotation(annotations.SandboxNamespace, sandboxConfig.GetMetadata().GetNamespace()),
-		customopts.WithAnnotation(annotations.SandboxUID, sandboxConfig.GetMetadata().GetUid()),
-		customopts.WithAnnotation(annotations.SandboxName, sandboxConfig.GetMetadata().GetName()),
-		customopts.WithAnnotation(annotations.ContainerName, containerName),
-		customopts.WithAnnotation(annotations.ImageName, imageName),
+	)
+	specOpts = append(
+		specOpts,
+		annotations.DefaultCRIAnnotations(sandboxID, containerName, imageName, sandboxConfig, false)...,
 	)
 
 	// cgroupns is used for hiding /sys/fs/cgroup from containers.
@@ -728,7 +738,7 @@ func (c *criService) buildWindowsSpec(
 	sandboxConfig *runtime.PodSandboxConfig,
 	imageConfig *imagespec.ImageConfig,
 	extraMounts []*runtime.Mount,
-	ociRuntime config.Runtime,
+	ociRuntime criconfig.Runtime,
 ) (_ []oci.SpecOpts, retErr error) {
 	specOpts := []oci.SpecOpts{
 		customopts.WithProcessArgs(config, imageConfig),
@@ -806,15 +816,9 @@ func (c *criService) buildWindowsSpec(
 		specOpts = append(specOpts, customopts.WithAnnotation(pKey, pValue))
 	}
 
+	specOpts = append(specOpts, customopts.WithAnnotation(annotations.WindowsHostProcess, strconv.FormatBool(sandboxHpc)))
 	specOpts = append(specOpts,
-		customopts.WithAnnotation(annotations.ContainerType, annotations.ContainerTypeContainer),
-		customopts.WithAnnotation(annotations.SandboxID, sandboxID),
-		customopts.WithAnnotation(annotations.SandboxNamespace, sandboxConfig.GetMetadata().GetNamespace()),
-		customopts.WithAnnotation(annotations.SandboxUID, sandboxConfig.GetMetadata().GetUid()),
-		customopts.WithAnnotation(annotations.SandboxName, sandboxConfig.GetMetadata().GetName()),
-		customopts.WithAnnotation(annotations.ContainerName, containerName),
-		customopts.WithAnnotation(annotations.ImageName, imageName),
-		customopts.WithAnnotation(annotations.WindowsHostProcess, strconv.FormatBool(sandboxHpc)),
+		annotations.DefaultCRIAnnotations(sandboxID, containerName, imageName, sandboxConfig, false)...,
 	)
 
 	return specOpts, nil
@@ -829,7 +833,7 @@ func (c *criService) buildDarwinSpec(
 	sandboxConfig *runtime.PodSandboxConfig,
 	imageConfig *imagespec.ImageConfig,
 	extraMounts []*runtime.Mount,
-	ociRuntime config.Runtime,
+	ociRuntime criconfig.Runtime,
 ) (_ []oci.SpecOpts, retErr error) {
 	specOpts := []oci.SpecOpts{
 		customopts.WithProcessArgs(config, imageConfig),
@@ -866,13 +870,7 @@ func (c *criService) buildDarwinSpec(
 	}
 
 	specOpts = append(specOpts,
-		customopts.WithAnnotation(annotations.ContainerType, annotations.ContainerTypeContainer),
-		customopts.WithAnnotation(annotations.SandboxID, sandboxID),
-		customopts.WithAnnotation(annotations.SandboxNamespace, sandboxConfig.GetMetadata().GetNamespace()),
-		customopts.WithAnnotation(annotations.SandboxUID, sandboxConfig.GetMetadata().GetUid()),
-		customopts.WithAnnotation(annotations.SandboxName, sandboxConfig.GetMetadata().GetName()),
-		customopts.WithAnnotation(annotations.ContainerName, containerName),
-		customopts.WithAnnotation(annotations.ImageName, imageName),
+		annotations.DefaultCRIAnnotations(sandboxID, containerName, imageName, sandboxConfig, false)...,
 	)
 
 	return specOpts, nil

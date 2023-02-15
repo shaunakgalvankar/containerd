@@ -28,7 +28,7 @@ import (
 	"time"
 
 	cni "github.com/containerd/go-cni"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/typeurl/v2"
 	"github.com/davecgh/go-spew/spew"
 	selinux "github.com/opencontainers/selinux/go-selinux"
 	"github.com/sirupsen/logrus"
@@ -44,7 +44,6 @@ import (
 	"github.com/containerd/containerd/pkg/cri/server/bandwidth"
 	sandboxstore "github.com/containerd/containerd/pkg/cri/store/sandbox"
 	"github.com/containerd/containerd/pkg/cri/util"
-	ctrdutil "github.com/containerd/containerd/pkg/cri/util"
 	"github.com/containerd/containerd/pkg/netns"
 	"github.com/containerd/containerd/snapshots"
 )
@@ -195,7 +194,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	defer func() {
 		// Delete container only if all the resource cleanup is done.
 		if retErr != nil && cleanupErr == nil {
-			deferCtx, deferCancel := ctrdutil.DeferContext()
+			deferCtx, deferCancel := util.DeferContext()
 			defer deferCancel()
 			if cleanupErr = container.Delete(deferCtx, containerd.WithSnapshotCleanup); cleanupErr != nil {
 				log.G(ctx).WithError(cleanupErr).Errorf("Failed to delete containerd container %q", id)
@@ -317,7 +316,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		defer func() {
 			// Teardown the network only if all the resource cleanup is done.
 			if retErr != nil && cleanupErr == nil {
-				deferCtx, deferCancel := ctrdutil.DeferContext()
+				deferCtx, deferCancel := util.DeferContext()
 				defer deferCancel()
 				// Teardown network if an error is returned.
 				if cleanupErr = c.teardownPodNetwork(deferCtx, sandbox); cleanupErr != nil {
@@ -364,7 +363,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	}
 	defer func() {
 		if retErr != nil {
-			deferCtx, deferCancel := ctrdutil.DeferContext()
+			deferCtx, deferCancel := util.DeferContext()
 			defer deferCancel()
 			// Cleanup the sandbox container if an error is returned.
 			if _, err := task.Delete(deferCtx, containerd.WithProcessKill); err != nil && !errdefs.IsNotFound(err) {
@@ -375,7 +374,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	}()
 
 	// wait is a long running background request, no timeout needed.
-	exitCh, err := task.Wait(ctrdutil.NamespacedContext())
+	exitCh, err := task.Wait(util.NamespacedContext())
 	if err != nil {
 		return nil, fmt.Errorf("failed to wait for sandbox container task: %w", err)
 	}
@@ -438,7 +437,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		defer func() {
 			// Teardown the network only if all the resource cleanup is done.
 			if retErr != nil && cleanupErr == nil {
-				deferCtx, deferCancel := ctrdutil.DeferContext()
+				deferCtx, deferCancel := util.DeferContext()
 				defer deferCancel()
 				// Teardown network if an error is returned.
 				if cleanupErr = c.teardownPodNetwork(deferCtx, sandbox); cleanupErr != nil {
@@ -462,20 +461,18 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		sandboxCreateNetworkTimer.UpdateSince(netStart)
 	}
 
-	if c.nri.isEnabled() {
-		err = c.nri.runPodSandbox(ctx, &sandbox)
-		if err != nil {
-			return nil, fmt.Errorf("NRI RunPodSandbox failed: %w", err)
-		}
-
-		defer func() {
-			if retErr != nil {
-				deferCtx, deferCancel := ctrdutil.DeferContext()
-				defer deferCancel()
-				c.nri.removePodSandbox(deferCtx, &sandbox)
-			}
-		}()
+	err = c.nri.RunPodSandbox(ctx, &sandbox)
+	if err != nil {
+		return nil, fmt.Errorf("NRI RunPodSandbox failed: %w", err)
 	}
+
+	defer func() {
+		if retErr != nil {
+			deferCtx, deferCancel := util.DeferContext()
+			defer deferCancel()
+			c.nri.RemovePodSandbox(deferCtx, &sandbox)
+		}
+	}()
 
 	if err := task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("failed to start sandbox container task %q: %w", id, err)
@@ -596,6 +593,10 @@ func cniNamespaceOpts(id string, config *runtime.PodSandboxConfig) ([]cni.Namesp
 	dns := toCNIDNS(config.GetDnsConfig())
 	if dns != nil {
 		opts = append(opts, cni.WithCapabilityDNS(*dns))
+	}
+
+	if cgroup := config.GetLinux().GetCgroupParent(); cgroup != "" {
+		opts = append(opts, cni.WithCapabilityCgroupPath(cgroup))
 	}
 
 	return opts, nil

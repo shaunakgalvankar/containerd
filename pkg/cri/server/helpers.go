@@ -39,7 +39,7 @@ import (
 	"github.com/containerd/containerd/reference/docker"
 	"github.com/containerd/containerd/runtime/linux/runctypes"
 	runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/typeurl/v2"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 
@@ -94,9 +94,6 @@ const (
 
 	// runtimeRunhcsV1 is the runtime type for runhcs.
 	runtimeRunhcsV1 = "io.containerd.runhcs.v1"
-
-	// name prefix for CRI server specific spans
-	criSpanPrefix = "pkg.cri.server"
 )
 
 // makeSandboxName generates sandbox name from sandbox metadata. The name
@@ -359,6 +356,16 @@ func generateRuntimeOptions(r criconfig.Runtime, c criconfig.Config) (interface{
 	if err := optionsTree.Unmarshal(options); err != nil {
 		return nil, err
 	}
+
+	// For generic configuration, if no config path specified (preserving old behavior), pass
+	// the whole TOML configuration section to the runtime.
+	if runtimeOpts, ok := options.(*runtimeoptions.Options); ok && runtimeOpts.ConfigPath == "" {
+		runtimeOpts.ConfigBody, err = optionsTree.Marshal()
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal TOML blob for runtime %q: %v", r.Type, err)
+		}
+	}
+
 	return options, nil
 }
 
@@ -523,10 +530,8 @@ func copyResourcesToStatus(spec *runtimespec.Spec, status containerstore.Status)
 func (c *criService) generateAndSendContainerEvent(ctx context.Context, containerID string, sandboxID string, eventType runtime.ContainerEventType) {
 	podSandboxStatus, err := c.getPodSandboxStatus(ctx, sandboxID)
 	if err != nil {
-		// TODO(https://github.com/containerd/containerd/issues/7785):
-		// Do not skip events with nil PodSandboxStatus.
-		logrus.Errorf("Failed to get podSandbox status for container event for sandboxID %q: %v. Skipping sending the event.", sandboxID, err)
-		return
+		logrus.Warnf("Failed to get podSandbox status for container event for sandboxID %q: %v. Sending the event with nil podSandboxStatus.", sandboxID, err)
+		podSandboxStatus = nil
 	}
 	containerStatuses, err := c.getContainerStatuses(ctx, sandboxID)
 	if err != nil {
